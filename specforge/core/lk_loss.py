@@ -45,8 +45,20 @@ def _acceptance_rate_per_token_from_logits(
     target_probs: torch.Tensor,
 ) -> torch.Tensor:
     """Return per-token expected acceptance from draft logits and target probs."""
-    draft_p = F.softmax(logits.to(torch.float32), dim=-1).to(target_probs.dtype)
-    return expected_acceptance_rate(target_probs=target_probs, draft_probs=draft_p)
+    # PATCH(chunk-acc): 整条 fp32 softmax 峰值 = 2×L×vocab×4B(fp32 副本+输出),
+    # L=13483 时 ~3.2GiB 瞬时,是 14336 训练 OOM 的压垮稻草;按位置分块,结果逐元素相同
+    CHUNK = 512
+    outs = []
+    for s in range(0, logits.shape[1], CHUNK):
+        draft_p = F.softmax(logits[:, s : s + CHUNK].to(torch.float32), dim=-1).to(
+            target_probs.dtype
+        )
+        outs.append(
+            expected_acceptance_rate(
+                target_probs=target_probs[:, s : s + CHUNK], draft_probs=draft_p
+            )
+        )
+    return torch.cat(outs, dim=1)
 
 
 def compute_acceptance_rate(

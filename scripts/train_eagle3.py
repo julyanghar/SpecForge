@@ -89,6 +89,41 @@ def print_cuda_memory_debug(label: str) -> None:
     )
 
 
+def mcmem_probe(label: str, dump_summary: bool = False) -> None:
+    """MCMEM_(memory_summary 拆解，仅测量): env MCMEM_DBG=1 门控的逐点显存探针。
+    一行给出 nvidia-smi used / torch alloc / reserved / 本步峰值 max_alloc /
+    碎片(reserved-alloc) / 非torch(nvsmi_used-reserved)，供逐桶对账。默认关、零扰动。"""
+    if os.getenv("MCMEM_DBG") != "1" or not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+        free_b, total_b = torch.cuda.mem_get_info()
+        alloc = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        max_alloc = torch.cuda.max_memory_allocated()
+        max_reserved = torch.cuda.max_memory_reserved()
+    except Exception as exc:  # noqa: BLE001
+        print(f"MCMEM_ {label}: query failed: {exc}", flush=True)
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else "NA"
+    used = total_b - free_b
+    print(
+        f"MCMEM_ {label}: rank={rank} "
+        f"nvsmi_used={used / 1024**3:.2f} "
+        f"alloc={alloc / 1024**3:.2f} reserved={reserved / 1024**3:.2f} "
+        f"max_alloc={max_alloc / 1024**3:.2f} max_reserved={max_reserved / 1024**3:.2f} "
+        f"frag={(reserved - alloc) / 1024**3:.2f} "
+        f"nontorch={(used - reserved) / 1024**3:.2f}",
+        flush=True,
+    )
+    if dump_summary:
+        print(
+            f"MCMEM_SUMMARY_BEGIN {label} rank={rank}\n"
+            f"{torch.cuda.memory_summary()}\nMCMEM_SUMMARY_END",
+            flush=True,
+        )
+
+
 def build_parser() -> ArgumentParser:
     """Build the training argument parser (import-safe seam for tests)."""
     parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
@@ -119,6 +154,21 @@ def build_parser() -> ArgumentParser:
     )
     model_group.add_argument(
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
+    )
+    model_group.add_argument(
+        "--trim-loss-positions",
+        action="store_true",
+        dest="trim_loss_positions",
+        help="A-level trim: compute teacher target_p and draft logits/loss only at "
+        "supervised positions (loss_mask=1); mathematically equivalent (mean rescaled). "
+        "Falls back to full-length for batch>1 / lk_loss / VL. Default off.",
+    )
+    model_group.add_argument(
+        "--trim-prompt-rows",
+        action="store_true",
+        dest="trim_prompt_rows",
+        help="B-level trim (requires --trim-loss-positions): TTT steps 2..k forward only "
+        "supervised rows (prompt rows serve as step-1 KV context only). Default off.",
     )
     model_group.add_argument(
         "--shard-target-output",
@@ -527,7 +577,14 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
-        ).cuda()
+        )
+        # PATCH(ropebuf): transformers meta-device 加载不回填 non-persistent buffer,
+        # inv_freq/cos_cached/sin_cached 是未初始化内存(GPU 上含 nan)→ 重建 rotary
+        for _m in draft_model.modules():
+            if hasattr(_m, "_init_rope"):
+                _m._init_rope()
+                print_with_rank("PATCH(ropebuf): rebuilt rotary buffers after from_pretrained")
+        draft_model = draft_model.cuda()
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
@@ -1012,6 +1069,11 @@ def main():
     print_args_with_dots(args)
     print_with_rank("Initialized distributed environment")
     print_cuda_memory_debug("after init_distributed")
+    # MCMEM: 从最开头就录分配历史，让 draft权重/sglang/fp32master/Adam/激活 都带栈帧，
+    # step5 dump 时可把每块驻留显存归因到来源。仅 MCMEM_SNAPSHOT=1 时开。
+    if os.getenv("MCMEM_SNAPSHOT") == "1":
+        torch.cuda.memory._record_memory_history(max_entries=400000)
+        print("MCMEM_SNAPSHOT recording started (pre-build)", flush=True)
 
     # ================================================
     # 2. Build models
@@ -1033,8 +1095,15 @@ def main():
     print_cuda_memory_debug("after build_dataloaders")
 
     # we load the vocab mapping then
-    draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_with_rank("Loaded vocab mapping")
+    # PATCH(vocab-mapping): warm-start(--ckpt-dir)时跳过覆盖——ckpt 的 t2d/d2t 与其
+    # lm_head 行语义绑定,用新数据重算的映射覆盖会让 lm_head 静默错位(上游 PR#534 未合并)。
+    if args.ckpt_dir is not None:
+        print_with_rank(
+            "PATCH: --ckpt-dir set, KEEP checkpoint t2d/d2t (skip load_vocab_mapping overwrite)"
+        )
+    else:
+        draft_model.load_vocab_mapping(vocab_mapping_path)
+        print_with_rank("Loaded vocab mapping")
     print_cuda_memory_debug("after load_vocab_mapping")
 
     if args.compact_teacher:
@@ -1084,6 +1153,8 @@ def main():
                 lk_loss_type=args.lk_loss_type,
                 kl_scale=args.kl_scale,
                 kl_decay=args.kl_decay,
+                trim_loss_positions=args.trim_loss_positions,
+                trim_prompt_rows=args.trim_prompt_rows,
             )
         else:
             # offline: the target_model is TargetHead not a model
@@ -1118,6 +1189,8 @@ def main():
         total_steps=args.total_steps,
     )
     print_with_rank("Initialized optimizer and scheduler")
+    # MCMEM: base 探针(此刻 Adam m/v 尚未 lazy 分配，只有 bf16权重+fp32master)
+    mcmem_probe("after_optimizer_init")
 
     # Restore optimizer/scheduler state for true resume
     if resume_state is not None:
@@ -1202,6 +1275,18 @@ def main():
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(output_path)
 
+            # MCMEM: per-step 峰值 reset(让 max_alloc 反映本步峰值) + allocation snapshot dump
+            # (record_memory_history 已在 build 前开启，此处只在 step5 dump 当前全部驻留段的栈)
+            if os.getenv("MCMEM_DBG") == "1" and global_step <= 8:
+                torch.cuda.reset_peak_memory_stats()
+            if os.getenv("MCMEM_SNAPSHOT") == "1" and global_step == 5:
+                _sp = os.path.join(
+                    args.output_dir, f"mcmem_snapshot_rank{dist.get_rank()}.pickle"
+                )
+                torch.cuda.memory._dump_snapshot(_sp)
+                torch.cuda.memory._record_memory_history(enabled=None)
+                print(f"MCMEM_SNAPSHOT dumped {_sp}", flush=True)
+
             # ================================================
             # 7.1 Training Step
             # ================================================
@@ -1220,7 +1305,29 @@ def main():
                 target_model,
                 is_online,
             )
+            # MCMEM: forward 后(激活驻留、梯度未生成)
+            if os.getenv("MCMEM_DBG") == "1" and global_step <= 8:
+                mcmem_probe(f"step{global_step}_after_forward")
             grad_norm = run_backward_and_update(args, plosses, optimizer, global_step)
+            # MCMEM: backward+step 后(step2 首次触发 optimizer.step → Adam m/v 分配=真 base)
+            if os.getenv("MCMEM_DBG") == "1" and global_step <= 8:
+                mcmem_probe(f"step{global_step}_after_step", dump_summary=(global_step in (2, 4)))
+            # MCMEM_OPT: 直接量优化器 state 字节(绕开 allocator 混淆)，判 base 里优化器占多少
+            if os.getenv("MCMEM_DBG") == "1" and global_step in (2, 6) and dist.get_rank() == 0:
+                _mstr = sum(p.numel() * p.element_size() for p in optimizer.fp32_params)
+                _ast, _ns = 0, 0
+                for _s in optimizer.optimizer.state.values():
+                    for _t in _s.values():
+                        if torch.is_tensor(_t):
+                            _ast += _t.numel() * _t.element_size()
+                    _ns += 1
+                _wt = sum(p.numel() * p.element_size() for p in optimizer.model_params)
+                print(
+                    f"MCMEM_OPT step={global_step} bf16_weight={_wt / 1024**3:.3f} "
+                    f"fp32_master={_mstr / 1024**3:.3f} adam_state={_ast / 1024**3:.3f} "
+                    f"n_params_with_state={_ns} n_trainable={len(optimizer.fp32_params)}",
+                    flush=True,
+                )
             if grad_norm is not None:
                 grad_norms.append(grad_norm)
 

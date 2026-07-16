@@ -112,7 +112,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True)
+# PATCH(nocompile): 摘除,dynamo+FSDP+累积梯度在变长重编译时内部崩(step2 InternalTorchDynamoError)
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
@@ -282,7 +282,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
         )
 
-    @torch.compile(dynamic=True)
+    # PATCH(nocompile): 同上
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len and seq_len > self.max_seq_len_cached:
@@ -760,6 +760,26 @@ class LlamaAttention(nn.Module):
         return attn_output
 
 
+
+
+def _ckpt_norm(norm, x):
+    """PATCH(ckpt-norm): eager RMSNorm 会把 fp32 中间量存进反向账本(L*5120*4B*2/次,
+    3 norm x 3 TTT步 ~ +3-4GB@12K),是 nocompile 补丁引入的显存回归。checkpoint 反向重算,
+    只存 bf16 输入;norm 重算成本可忽略且无副作用。"""
+    if torch.is_grad_enabled():
+        import torch.utils.checkpoint as _cp
+        return _cp.checkpoint(norm, x, use_reentrant=False)
+    return norm(x)
+
+def _MCDBG(tag, t):
+    import os as _o
+    if _o.environ.get("MCDBG_NAN", "0") != "1":
+        return
+    if t is None or not torch.is_tensor(t) or not t.is_floating_point():
+        return
+    _n = torch.isnan(t).sum().item()
+    print(f"MCDBG_NAN {tag}: nan={_n}/{t.numel()}", flush=True)
+
 class LlamaFlexAttention(LlamaAttention):
     """
     Attention layer implemented with flex attention. We keep the parameters consistent with LlamaAttention.
@@ -779,6 +799,7 @@ class LlamaFlexAttention(LlamaAttention):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        trim_ctx: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -812,12 +833,22 @@ class LlamaFlexAttention(LlamaAttention):
                 self.config.rope_scaling["mrope_section"],
             )
         else:
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
-            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            # Keep positions ids aligned when padding so the KV cache is unaffected.
-            query_states, key_states = apply_rotary_pos_emb(
-                query_states, key_states, cos, sin, position_ids + lck
-            )
+            if trim_ctx is None:
+                cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                # Keep positions ids aligned when padding so the KV cache is unaffected.
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids + lck
+                )
+            else:
+                # MCTRIM(B级):块宽不齐时 lck 无意义;调用方传绝对 rope 位置(sup+idx),
+                # rotary 表按 full_len+步数 保证覆盖。
+                _seq_len = trim_ctx["full_len"] + trim_ctx["step_idx"] + 1
+                cos, sin = self.rotary_emb(query_states, seq_len=_seq_len)
+                cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+                query_states, key_states = apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, position_ids
+                )
 
         cache_position: torch.Tensor = torch.arange(
             past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
@@ -830,11 +861,19 @@ class LlamaFlexAttention(LlamaAttention):
             layer_idx=0,  # TODO: support multiple layers
             cache_kwargs=cache_kwargs,
         )
+        _MCDBG("flexattn.q_rope", query_states)
+        _MCDBG("flexattn.key_cache", key_cache)
+        _MCDBG("flexattn.value_cache", value_cache)
 
         seq_lengths = attention_mask.sum(dim=-1)
         # Shrink the attention mask to align with the padding to the right.
         # This is equivalent to the shrinking logic in eagle3.py
-        seq_lengths -= lck
+        if trim_ctx is None:
+            seq_lengths = seq_lengths - lck
+        else:
+            # MCTRIM(B级):块宽不齐(L 后接 n_sup),lck 语义失效;有效长度用
+            # "步1有效长 - 当前步序号"(与全长版逐步 -1 对齐)。
+            seq_lengths = seq_lengths - trim_ctx["step_idx"]
         # TODO: Remove the usage of uncompiled create_block_mask after
         # https://github.com/pytorch/pytorch/issues/160018
         if q_len <= 128:
@@ -844,13 +883,26 @@ class LlamaFlexAttention(LlamaAttention):
             create_block_mask_func = compile_friendly_create_block_mask
             flex_attention_func = compile_friendly_flex_attention
 
-        block_mask = create_block_mask_func(
-            mask_mod=generate_eagle3_mask(
+        if trim_ctx is None:
+            _mask_mod = generate_eagle3_mask(
                 seq_lengths=seq_lengths,
                 Q_LEN=q_len,
                 KV_LEN=key_cache.shape[-2],
                 lck=lck,
-            ),
+            )
+        else:
+            from specforge.modeling.draft.flex_attention import (
+                generate_eagle3_mask_compact,
+            )
+            _mask_mod = generate_eagle3_mask_compact(
+                sup=trim_ctx["sup"],
+                seq_lengths=seq_lengths,
+                full_len=trim_ctx["full_len"],
+                Q_LEN=q_len,
+                KV_LEN=key_cache.shape[-2],
+            )
+        block_mask = create_block_mask_func(
+            mask_mod=_mask_mod,
             B=bsz,
             H=1,  # Rely on broadcast
             Q_LEN=q_len,
@@ -864,9 +916,11 @@ class LlamaFlexAttention(LlamaAttention):
             block_mask=block_mask,
             enable_gqa=True,
         )
+        _MCDBG("flexattn.flex_out", attn_output)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
+        _MCDBG("flexattn.o_proj_out", attn_output)
         return attn_output
 
 
@@ -1532,7 +1586,7 @@ class LlamaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    @torch.compile(dynamic=True)
+    # PATCH(nocompile): 同上
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -1579,6 +1633,7 @@ class LlamaDecoderLayer(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        trim_ctx: Optional[dict] = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -1597,9 +1652,13 @@ class LlamaDecoderLayer(nn.Module):
         """
 
         residual = hidden_states
+        _MCDBG("layer.in_hidden", hidden_states)
+        _MCDBG("layer.in_emb", input_emb)
 
-        hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
+        hidden_states = _ckpt_norm(self.hidden_norm, hidden_states)
+        input_emb = _ckpt_norm(self.input_layernorm, input_emb)
+        _MCDBG("layer.after_norms_hidden", hidden_states)
+        _MCDBG("layer.after_norms_emb", input_emb)
 
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
         # Self Attention
@@ -1611,13 +1670,16 @@ class LlamaDecoderLayer(nn.Module):
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            trim_ctx=trim_ctx,
         )
+        _MCDBG("layer.attn_out", hidden_states)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = _ckpt_norm(self.post_attention_layernorm, hidden_states)
         hidden_states = self.mlp(hidden_states)
+        _MCDBG("layer.mlp_out", hidden_states)
         hidden_states = residual + hidden_states
 
         # outputs = (hidden_states, return_hidden)
@@ -1714,7 +1776,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
 
         # norm
-        hidden_states = self.norm(hidden_states)
+        hidden_states = _ckpt_norm(self.norm, hidden_states)
 
         return hidden_states
 
@@ -1727,7 +1789,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        norm_hidden_states = self.norm(hidden_states)
+        norm_hidden_states = _ckpt_norm(self.norm, hidden_states)
         return self.lm_head(norm_hidden_states)
 
     def backbone(
@@ -1739,6 +1801,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
+        trim_ctx: Optional[dict] = None,
     ) -> torch.Tensor:
         return self.midlayer(
             input_emb=input_embeds,
@@ -1749,4 +1812,5 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             past_key_values=past_key_values,
             output_attentions=False,
             use_cache=False,
+            trim_ctx=trim_ctx,
         )

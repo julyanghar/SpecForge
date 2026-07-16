@@ -125,3 +125,32 @@ def generate_eagle3_mask(
     mask_mod = or_masks(causal_mask, suffix_mask)
     mask_mod.__name__ = f"eagle3_mask_Q_{Q_LEN}_KV_{KV_LEN}_lck_{lck}"
     return mask_mod
+
+
+def generate_eagle3_mask_compact(
+    sup: "torch.Tensor", seq_lengths: "torch.Tensor", full_len: int,
+    Q_LEN: int, KV_LEN: int
+):
+    """MCTRIM(B级):TTT 步 2..k 只跑监督行时的 mask。
+
+    q 行 r 对应绝对位置 sup[r];KV 布局 = [步1 全长块 full_len | 后续块 各 Q_LEN 宽]。
+    - 步1 块(kv_idx < full_len):绝对 causal:sup[r] >= kv_idx,且双方在有效长度内;
+    - 后续块:对角线私有:块内偏移 == r(与全长版 suffix_mask 的 (kv-q)%L==0 同语义)。
+    """
+
+    def causal_mask(b, h, q_idx, kv_idx):
+        abs_q = sup[q_idx]
+        in_prefix = kv_idx < full_len
+        causal = abs_q >= kv_idx
+        padding = (kv_idx < seq_lengths[b]) & (abs_q < seq_lengths[b])
+        return in_prefix & causal & padding
+
+    def suffix_mask(b, h, q_idx, kv_idx):
+        in_suffix = kv_idx >= full_len
+        diagonal = ((kv_idx - full_len) % Q_LEN) == q_idx
+        padding = sup[q_idx] < seq_lengths[b]
+        return in_suffix & diagonal & padding
+
+    mask_mod = or_masks(causal_mask, suffix_mask)
+    mask_mod.__name__ = f"eagle3_mask_compact_Q_{Q_LEN}_KV_{KV_LEN}"
+    return mask_mod

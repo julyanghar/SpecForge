@@ -357,6 +357,11 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             # drop aux hidden states). sglang 0.5.14 removed the separate
             # piecewise-CUDA-graph args, so disabling CUDA graph entirely covers it.
             disable_cuda_graph=True,
+            # PATCH(chunked-prefill): SpecForge 的 _extend 一次性提交整个 batch
+            # (target_batch_size×max_length token),而 chunked_prefill_size>0 时
+            # eager_runner 的 buffer 只按 prefill 上限(默认~4096)分配 → foreach_copy
+            # 尺寸不匹配崩溃。禁用分块后 buffer 按 max_total_num_tokens 分配,正好对齐。
+            chunked_prefill_size=-1,
             tp_size=tp_size,
             pp_size=1,
             **kwargs,

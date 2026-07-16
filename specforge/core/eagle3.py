@@ -116,6 +116,8 @@ class OnlineEagle3Model(Eagle3Model):
         lk_loss_type: Optional[str] = None,
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
+        trim_loss_positions: bool = False,
+        trim_prompt_rows: bool = False,
     ):
         """
         Args:
@@ -125,6 +127,8 @@ class OnlineEagle3Model(Eagle3Model):
             lk_loss_type: LK loss objective type. One of {"lambda", "alpha"}.
             kl_scale: Initial KL weight scale for lambda LK loss.
             kl_decay: Decay factor for adaptive KL weight in lambda LK loss.
+            trim_loss_positions: A级裁剪——teacher/logits/loss 只在监督位置计算,
+                数学等价(mean 分母重标定),默认关。batch>1 或 lk_loss 时自动回退全长。
         """
         super().__init__()
         self.draft_model = draft_model
@@ -134,6 +138,8 @@ class OnlineEagle3Model(Eagle3Model):
         self.lk_loss_type = lk_loss_type
         self.kl_scale = kl_scale
         self.kl_decay = kl_decay
+        self.trim_loss_positions = trim_loss_positions
+        self.trim_prompt_rows = trim_prompt_rows
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -150,6 +156,8 @@ class OnlineEagle3Model(Eagle3Model):
         position_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         adapter: BackendAdapter,
+        loss_scale: float = 1.0,
+        full_positions: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -184,8 +192,13 @@ class OnlineEagle3Model(Eagle3Model):
             reduce_metrics_fn=adapter.reduce_metrics,
             reduce_loss_fn=adapter.reduce_loss,
         )
+        if loss_scale != 1.0:
+            # MCTRIM(A级):紧凑 kernel 的 mean 分母是 n_sup,全长语义是 L —— 重标定。
+            # 仅 lk_loss_type is None 时调用方可传(loss==kl_loss 才是线性可缩的)。
+            loss = loss * loss_scale
         loss_denom = torch.tensor(
-            logits.shape[0] * logits.shape[1],
+            logits.shape[0]
+            * (full_positions if full_positions is not None else logits.shape[1]),
             device=logits.device,
             dtype=torch.float32,
         )
@@ -285,20 +298,60 @@ class OnlineEagle3Model(Eagle3Model):
                 chunk_size=compact_teacher_chunk_size,
             )
             del target_hidden_for_compact
+            trim_pack = None
         else:
-            (
-                target_p_padded,
-                target_p_on_draft_padded,
-                target_token_ids_padded,
-                position_mask,
-            ) = _compute_target_p_padded(
-                target=target,
-                t2d=self.draft_model.t2d,
-                loss_mask=loss_mask,
-                length=self.length,
+            # MCTRIM(A级):batch=1 且非 lk_loss 时,teacher 只在监督位置计算
+            _trim_ok = (
+                self.trim_loss_positions
+                and self.lk_loss_type is None
+                and loss_mask.shape[0] == 1
+                and int(loss_mask.sum().item()) > 0
             )
+            if _trim_ok:
+                import os as _os4
+                _sc = _os4.environ.get("MCTRIM_SELFCHECK", "0") == "1"
+                trim_pack = _build_trim_pack(
+                    target, self.draft_model.t2d, loss_mask, self.length
+                )
+                if _sc:
+                    trim_pack["_ref"] = _compute_target_p_padded(
+                        target=target, t2d=self.draft_model.t2d,
+                        loss_mask=loss_mask, length=self.length,
+                    )
+                target_p_padded = None
+                target_p_on_draft_padded = None
+                target_token_ids_padded = None
+                position_mask = trim_pack["position_mask_sup"]
+            else:
+                trim_pack = None
+                (
+                    target_p_padded,
+                    target_p_on_draft_padded,
+                    target_token_ids_padded,
+                    position_mask,
+                ) = _compute_target_p_padded(
+                    target=target,
+                    t2d=self.draft_model.t2d,
+                    loss_mask=loss_mask,
+                    length=self.length,
+                )
             del target
         torch.cuda.empty_cache()
+
+        import os as _os
+        if _os.environ.get("MCDBG_NAN", "0") == "1":
+            def _nanrep(tag, t):
+                if t is None or not torch.is_tensor(t) or not t.is_floating_point():
+                    return
+                n = torch.isnan(t).sum().item()
+                print(f"MCDBG_NAN {tag}: nan={n}/{t.numel()} shape={tuple(t.shape)} "
+                      f"finite_min={t[~torch.isnan(t)].min().item() if n < t.numel() else 'ALL_NAN'}", flush=True)
+            self._mcdbg = _nanrep
+            _nanrep("input_target_hidden", hidden_states)
+            _nanrep("target_p_padded", target_p_padded)
+            _nanrep("position_mask", position_mask.float() if position_mask is not None else None)
+        else:
+            self._mcdbg = lambda *a: None
 
         # basic info
         batch_size, seq_length, _ = hidden_states.shape
@@ -307,6 +360,7 @@ class OnlineEagle3Model(Eagle3Model):
 
         # Step 2: project the concatenated hidden states to the target hidden size
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
+        self._mcdbg("after_fc_projection", hidden_states)
 
         # Step 3: process kv cache, position ids and position ids
         if past_key_values is not None:
@@ -358,64 +412,202 @@ class OnlineEagle3Model(Eagle3Model):
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
+        _trim_B = trim_pack is not None and self.trim_prompt_rows
+        _sc_ref = None  # SELFCHECK 参考链(全长,no_grad,独立 cache)
         for idx in range(self.length):
-            state = adapter.step_view(
-                idx=idx,
-                ttt_length=self.length,
-                global_input_ids=global_input_ids,
-                attention_mask=attention_mask,
-                loss_mask=loss_mask,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                target_p_padded=target_p_padded,
-                target_p_on_draft_padded=target_p_on_draft_padded,
-                target_token_ids_padded=target_token_ids_padded,
-                position_mask=position_mask,
-                seq_length=seq_length,
+            _b_active = _trim_B and idx >= 1
+            trim_ctx = (
+                {"sup": trim_pack["sup"], "full_len": seq_length, "step_idx": idx}
+                if _b_active else None
             )
+            if _b_active:
+                # MCTRIM(B级):步 2..k 只跑监督行。步1输出在 idx==1 入口压紧;
+                # 之后 hidden 一直是紧凑形。rope 位置传绝对值 sup+idx。
+                import os as _os5
+                if idx == 1 and _os5.environ.get("MCTRIM_SELFCHECK", "0") == "1":
+                    _sc_ref = {
+                        "hidden": hidden_states.detach().clone(),
+                        "cache": None,
+                    }
+                    _sc_ref["cache"] = DynamicCache()
+                    _sc_ref["cache"].update(
+                        past_key_values.layers[0].keys.detach().clone(),
+                        past_key_values.layers[0].values.detach().clone(),
+                        layer_idx=0,
+                    )
+                if idx == 1:
+                    hidden_states = hidden_states.index_select(1, trim_pack["sup"])
+                step_input_ids = global_input_ids.index_select(1, trim_pack["sup"])
+                step_hidden = hidden_states
+                step_attn = attention_mask
+                step_pos = trim_pack["sup"].unsqueeze(0) + idx
+            elif trim_pack is not None:
+                # MCTRIM(A级):teacher 已紧凑化,step_view 只为切 teacher 表;
+                # SdpaLike 下 backbone 输入就是循环变量本身,直接用。
+                step_input_ids = global_input_ids
+                step_hidden = hidden_states
+                step_attn = attention_mask
+                step_pos = position_ids
+            else:
+                state = adapter.step_view(
+                    idx=idx,
+                    ttt_length=self.length,
+                    global_input_ids=global_input_ids,
+                    attention_mask=attention_mask,
+                    loss_mask=loss_mask,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    target_p_padded=target_p_padded,
+                    target_p_on_draft_padded=target_p_on_draft_padded,
+                    target_token_ids_padded=target_token_ids_padded,
+                    position_mask=position_mask,
+                    seq_length=seq_length,
+                )
+                step_input_ids = state.input_ids
+                step_hidden = state.hidden_states
+                step_attn = state.attention_mask
+                step_pos = state.position_ids
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            inputs_embeds = self.draft_model.embed_input_ids(state.input_ids)
+            inputs_embeds = self.draft_model.embed_input_ids(step_input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
-                hidden_states=state.hidden_states,
+                hidden_states=step_hidden,
                 cache_hidden=cache_hidden,
-                attention_mask=state.attention_mask,
-                position_ids=state.position_ids,
+                attention_mask=step_attn,
+                position_ids=step_pos,
                 past_key_values=past_key_values,
                 use_cache=True,
+                trim_ctx=trim_ctx,
             )
+            if _b_active and _sc_ref is not None:
+                # MCTRIM_SCB:全长参考链(no_grad,独立 cache)对拍监督行输出
+                with torch.no_grad():
+                    _ref_embeds = self.draft_model.embed_input_ids(global_input_ids)
+                    _ref_embeds = _ref_embeds.to(_sc_ref["hidden"].dtype)
+                    _ref_out = self.draft_model.backbone(
+                        input_embeds=_ref_embeds,
+                        hidden_states=_sc_ref["hidden"],
+                        cache_hidden=None,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=_sc_ref["cache"],
+                        use_cache=True,
+                    )
+                    _sc_ref["hidden"] = _ref_out
+                    _d = (
+                        _ref_out.index_select(1, trim_pack["sup"]) - hidden_states_out
+                    ).abs().max().item()
+                    print(f"MCTRIM_SCB step={idx} hid_maxdiff={_d:.3e}", flush=True)
 
             # update hidden states for next step
             hidden_states = hidden_states_out
+            self._mcdbg(f"ttt{idx}_backbone_out", hidden_states)
 
-            # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
-
-            # Step 5.5 + 5.6: metric and loss
-            (
-                acc,
-                acceptance_rate,
-                loss,
-                correct,
-                denom,
-                metric_loss,
-                loss_denom,
-            ) = self._acc_and_loss(
-                logits=logits,
-                target_p=state.target_p,
-                target_p_on_draft=state.target_p_on_draft,
-                target_token_ids=state.target_token_ids,
-                position_mask=state.position_mask,
-                loss_mask=state.loss_mask,
-                adapter=adapter,
-            )
+            # Step 5.4 + 5.5 + 5.6: logits, metric and loss
+            if trim_pack is not None:
+                # MCTRIM(A级):只对监督行过 norm+lm_head;teacher 按滑窗索引紧凑取用
+                sup = trim_pack["sup"]
+                idx_j = trim_pack["idx_steps"][idx]
+                if _b_active:
+                    hidden_sup = hidden_states  # B级下已是紧凑形
+                else:
+                    hidden_sup = hidden_states.index_select(1, sup)
+                logits = self.draft_model.compute_logits(hidden_sup)
+                import os as _os3
+                if _os3.environ.get("MCTRIM_SELFCHECK", "0") == "1" and trim_pack.get("_ref") is not None:
+                    with torch.no_grad():
+                        _ref = trim_pack["_ref"]
+                        _sl = slice(idx, idx + seq_length)
+                        _f_tp = _ref[0][:, _sl][:, sup]
+                        _f_tpd = _ref[1][:, _sl][:, sup]
+                        _f_tok = _ref[2][:, _sl][:, sup]
+                        _f_pm = _ref[3][:, sup]
+                        _t_tp = trim_pack["target_p_c"].index_select(1, idx_j)
+                        _t_tpd = trim_pack["on_draft_c"].index_select(1, idx_j)
+                        _t_tok = trim_pack["token_ids_c"].index_select(1, idx_j)
+                        _full_hidden_src = (
+                            _sc_ref["hidden"] if (_b_active and _sc_ref is not None)
+                            else hidden_states
+                        )
+                        _full_logits_all = self.draft_model.compute_logits(_full_hidden_src)
+                        _full_logits = _full_logits_all[:, sup]
+                        from specforge.core.loss import LogSoftmaxLoss as _LSL
+                        from specforge.core.loss import _compute_loss as _REF
+                        _scale = sup.numel() / trim_pack["full_len"]
+                        _tp_full = _ref[0][:, _sl].contiguous()
+                        _ref_full = _REF(_full_logits_all, _tp_full, _ref[3])
+                        _ref_trim = _REF(logits, _t_tp, trim_pack["position_mask_sup"]) * _scale
+                        _ker_full = _LSL.apply(_full_logits_all, _tp_full, _ref[3])
+                        _ker_trim = _LSL.apply(logits, _t_tp, trim_pack["position_mask_sup"]) * _scale
+                        print(f"MCTRIM_SC4 step={idx} n_sup={sup.numel()} "
+                              f"ref_full={_ref_full.double().item():.10f} ref_trim={_ref_trim.double().item():.10f} "
+                              f"ker_full={_ker_full.double().item():.10f} ker_trim={_ker_trim.double().item():.10f}", flush=True)
+                        print(f"MCTRIM_SC step={idx} tp={( _f_tp - _t_tp).abs().max().item():.3e} "
+                              f"tpd={(_f_tpd - _t_tpd).abs().max().item():.3e} "
+                              f"tok={(_f_tok != _t_tok).sum().item()} "
+                              f"pm={(_f_pm - trim_pack['position_mask_sup']).abs().max().item():.3e} "
+                              f"logits={(_full_logits - logits).abs().max().item():.3e}", flush=True)
+                self._mcdbg(f"ttt{idx}_logits", logits)
+                n_sup = sup.numel()
+                (
+                    acc,
+                    acceptance_rate,
+                    loss,
+                    correct,
+                    denom,
+                    metric_loss,
+                    loss_denom,
+                ) = self._acc_and_loss(
+                    logits=logits,
+                    target_p=trim_pack["target_p_c"].index_select(1, idx_j),
+                    target_p_on_draft=trim_pack["on_draft_c"].index_select(1, idx_j),
+                    target_token_ids=trim_pack["token_ids_c"].index_select(1, idx_j),
+                    position_mask=trim_pack["position_mask_sup"],
+                    loss_mask=trim_pack["loss_mask_sup"],
+                    adapter=adapter,
+                    loss_scale=n_sup / trim_pack["full_len"],
+                    full_positions=trim_pack["full_len"],
+                )
+            else:
+                logits = self.draft_model.compute_logits(hidden_states)
+                self._mcdbg(f"ttt{idx}_logits", logits)
+                (
+                    acc,
+                    acceptance_rate,
+                    loss,
+                    correct,
+                    denom,
+                    metric_loss,
+                    loss_denom,
+                ) = self._acc_and_loss(
+                    logits=logits,
+                    target_p=state.target_p,
+                    target_p_on_draft=state.target_p_on_draft,
+                    target_token_ids=state.target_token_ids,
+                    position_mask=state.position_mask,
+                    loss_mask=state.loss_mask,
+                    adapter=adapter,
+                )
             acces.append(acc)
             acceptance_rates.append(acceptance_rate)
+            self._mcdbg(f"ttt{idx}_loss", loss)
+            import os as _os2
+            if _os2.environ.get("MCTRIM_DBG", "0") == "1":
+                _n_sup = (
+                    trim_pack["sup"].numel() if trim_pack is not None
+                    else int(loss_mask.sum().item())
+                )
+                print(
+                    f"MCTRIM_loss step={idx} trim={'on' if trim_pack is not None else 'off'} "
+                    f"loss={loss.double().item():.10f} acc={acc.double().item():.6f} "
+                    f"ar={acceptance_rate.double().item():.6f} n_sup={_n_sup} L={seq_length}",
+                    flush=True,
+                )
             plosses.append(loss)
             metric_corrects.append(correct)
             metric_denoms.append(denom)
@@ -830,6 +1022,79 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
             target_token_ids_padded,
             position_mask,
         )
+
+
+
+def _compute_target_p_eager(target, t2d, loss_mask, row_chunk=256):
+    """MCTRIM: _compute_target_p 的非编译版(逐 batch 形状变化,套 compile 会重编译风暴)。
+    数学与编译版一致;按行分块压全词表 fp32 瞬时(n_sup 大时原本可达数 GB)。"""
+    tps, tpds, toks, pms = [], [], [], []
+    n = target.shape[1]
+    for s in range(0, n, row_chunk):
+        t = target[:, s : s + row_chunk].float()
+        ids = t.argmax(-1)
+        tm = t2d[ids][..., None].int()
+        pms.append(tm * loss_mask[:, s : s + row_chunk])
+        dth = t[..., t2d]
+        tps.append(nn.Softmax(dim=2)(dth).detach())
+        lse = torch.logsumexp(t, dim=-1, keepdim=True)
+        tpds.append(torch.exp(dth - lse).detach())
+        toks.append(ids.detach())
+    return (torch.cat(tps, 1), torch.cat(tpds, 1),
+            torch.cat(toks, 1), torch.cat(pms, 1))
+
+
+def _build_trim_pack(target, t2d, loss_mask, length):
+    """A级裁剪(--trim-loss-positions):teacher 只在"监督行及其 k 步滑窗位置"上计算。
+
+    语义对齐 _compute_target_p_padded + step_view 滑窗:
+    - 监督行集合全 k 步共用(SpecForge 的 mask 不随步 shift,teacher 表滑窗);
+    - 步 j 的 teacher = 位置 sup+j;越过 L 的位置 = pad 行(target_p 均匀 1/V,
+      on_draft=0,token_id=0,与 F.pad 的 value 完全一致)。
+    仅支持 batch=1(我们 online 每 rank batch=1);B>1 由调用方回退全长路径。
+    返回 dict:sup[n_sup], 每步 teacher 取用的 gather 索引 idx_steps[k][n_sup],
+    紧凑表 target_p_c/on_draft_c/token_ids_c([1, n_real+1, ...],末行=pad 行),
+    position_mask_sup/loss_mask_sup([1, n_sup, 1])。
+    """
+    with torch.no_grad():
+        B, L = loss_mask.shape[0], loss_mask.shape[1]
+        assert B == 1, "trim path requires batch==1"
+        sup = loss_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)  # [n_sup]
+        shifted = torch.cat([sup + j for j in range(length + 1)])     # 步 j=0..k(含 k:与 pad 长度对齐)
+        uniq = torch.unique(shifted)
+        real = uniq[uniq < L]                                          # 真实 teacher 位置
+        n_real = real.numel()
+        target_sel = target[:, real]                                   # [1, n_real, V_target] 唯一的全词表切片
+        lm_sel = loss_mask[:, real]
+        tp, tpd, tok, _ = _compute_target_p_eager(target_sel, t2d, lm_sel)
+        V_d = tp.shape[-1]
+        # 末行 append pad 行(与 F.pad 的 value 一致)
+        pad_tp = torch.full((1, 1, V_d), 1.0 / V_d, dtype=tp.dtype, device=tp.device)
+        pad_tpd = torch.zeros((1, 1, V_d), dtype=tpd.dtype, device=tpd.device)
+        pad_tok = torch.zeros((1, 1), dtype=tok.dtype, device=tok.device)
+        target_p_c = torch.cat([tp, pad_tp], dim=1)
+        on_draft_c = torch.cat([tpd, pad_tpd], dim=1)
+        token_ids_c = torch.cat([tok, pad_tok], dim=1)
+        # remap:绝对位置 -> 紧凑表行号;未覆盖/越界位置 -> pad 行(n_real)
+        full_map = torch.full((L + length + 1,), n_real, dtype=torch.long, device=sup.device)
+        full_map[real] = torch.arange(n_real, device=sup.device)
+        idx_steps = [full_map[sup + j] for j in range(length)]
+        # position_mask 取链起点(sup)处——与全长路径对 step 不变的语义一致
+        pm_sup = _compute_position_mask_at(target, t2d, loss_mask, sup)
+        loss_mask_sup = loss_mask.view(-1)[sup].view(1, -1, 1)
+        return dict(sup=sup, idx_steps=idx_steps, target_p_c=target_p_c,
+                    on_draft_c=on_draft_c, token_ids_c=token_ids_c,
+                    position_mask_sup=pm_sup, loss_mask_sup=loss_mask_sup,
+                    full_len=L)
+
+
+def _compute_position_mask_at(target, t2d, loss_mask, sup):
+    """position_mask = t2d[argmax(target)] * loss_mask,只在 sup 位置上算。"""
+    with torch.no_grad():
+        tsel = target[:, sup]
+        ids = tsel.float().argmax(-1)
+        tm = t2d[ids][..., None].int()
+        return tm * loss_mask[:, sup]
 
 
 @torch.compile(dynamic=None)
