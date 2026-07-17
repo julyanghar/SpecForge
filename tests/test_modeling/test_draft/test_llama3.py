@@ -116,6 +116,57 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
             param2 = dict(model2.named_parameters())[name]
             self.assertTrue(torch.equal(param1, param2))
 
+    def test_rotary_buffers_absent_from_state_dict(self):
+        """Root cause: rotary buffers are non-persistent, so they are not saved.
+
+        inv_freq / cos_cached / sin_cached are registered with persistent=False, so a
+        checkpoint's state_dict does not contain them. transformers' meta-device load
+        path therefore leaves them uninitialized after from_pretrained (NaN on GPU),
+        which is why build_draft_model must rebuild them via _init_rope.
+        """
+        model = LlamaForCausalLMEagle3(self.config)
+        keys = model.state_dict().keys()
+        for buf in ("inv_freq", "cos_cached", "sin_cached"):
+            self.assertFalse(
+                any(k.endswith(buf) for k in keys),
+                f"{buf} unexpectedly present in state_dict (should be persistent=False)",
+            )
+
+    def test_rotary_buffers_rebuilt_after_from_pretrained(self):
+        """Regression test for the persistent=False rotary-buffer warm-start NaN bug.
+
+        After a real from_pretrained round-trip, re-running _init_rope (as
+        build_draft_model does) must yield finite rotary buffers identical to a
+        freshly-initialized reference. Equality is checked rather than relying on a
+        NaN observation, since CPU-only CI does not reliably reproduce the
+        uninitialized-memory NaN that the fix prevents on GPU.
+        """
+        ref = LlamaForCausalLMEagle3(self.config)
+        ref_rot = ref.midlayer.self_attn.rotary_emb
+        ref_bufs = {
+            name: getattr(ref_rot, name).clone()
+            for name in ("inv_freq", "cos_cached", "sin_cached")
+        }
+
+        ref.save_pretrained(self.temp_dir)
+        loaded = LlamaForCausalLMEagle3.from_pretrained(self.temp_dir)
+
+        # The fix in build_draft_model: rebuild non-persistent rotary buffers.
+        for module in loaded.modules():
+            if hasattr(module, "_init_rope"):
+                module._init_rope()
+
+        got_rot = loaded.midlayer.self_attn.rotary_emb
+        for name, ref_val in ref_bufs.items():
+            val = getattr(got_rot, name)
+            self.assertTrue(
+                torch.isfinite(val).all(), f"{name} non-finite after rebuild"
+            )
+            self.assertTrue(
+                torch.allclose(val.float(), ref_val.float()),
+                f"{name} does not match freshly-initialized reference",
+            )
+
     def test_config_validation(self):
         # A dimensionally-valid config (hidden_size divisible by num_attention_heads
         # so it passes transformers' strict config validation) that is still missing

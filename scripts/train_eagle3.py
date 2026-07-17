@@ -527,7 +527,23 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
-        ).cuda()
+        )
+        # The rotary embedding buffers (inv_freq / cos_cached / sin_cached) are
+        # registered with persistent=False, so they are not part of the checkpoint
+        # state_dict. When loading a checkpoint, transformers' meta-device /
+        # low_cpu_mem_usage path leaves these buffers uninitialized (NaN once moved
+        # to GPU), which makes warm-start training (e.g. --ckpt-dir) immediately
+        # diverge to loss=NaN. Rebuild them by re-running _init_rope before .cuda().
+        rebuilt_rope = False
+        for module in draft_model.modules():
+            if hasattr(module, "_init_rope"):
+                module._init_rope()
+                rebuilt_rope = True
+        if rebuilt_rope:
+            print_with_rank(
+                "Rebuilt non-persistent rotary buffers after from_pretrained"
+            )
+        draft_model = draft_model.cuda()
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
