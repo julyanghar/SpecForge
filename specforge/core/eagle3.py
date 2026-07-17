@@ -116,6 +116,7 @@ class OnlineEagle3Model(Eagle3Model):
         lk_loss_type: Optional[str] = None,
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
+        trim_loss_positions: bool = False,
     ):
         """
         Args:
@@ -125,6 +126,11 @@ class OnlineEagle3Model(Eagle3Model):
             lk_loss_type: LK loss objective type. One of {"lambda", "alpha"}.
             kl_scale: Initial KL weight scale for lambda LK loss.
             kl_decay: Decay factor for adaptive KL weight in lambda LK loss.
+            trim_loss_positions: when set, the teacher target_p, draft logits and
+                loss are computed only at supervised (loss-masked) positions rather
+                than over the full sequence. Mathematically equivalent after
+                rescaling the mean denominator; off by default. Automatically falls
+                back to the full-length path for batch > 1 or when an lk_loss is used.
         """
         super().__init__()
         self.draft_model = draft_model
@@ -134,6 +140,7 @@ class OnlineEagle3Model(Eagle3Model):
         self.lk_loss_type = lk_loss_type
         self.kl_scale = kl_scale
         self.kl_decay = kl_decay
+        self.trim_loss_positions = trim_loss_positions
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -150,6 +157,8 @@ class OnlineEagle3Model(Eagle3Model):
         position_mask: torch.Tensor,
         loss_mask: torch.Tensor,
         adapter: BackendAdapter,
+        loss_scale: float = 1.0,
+        full_positions: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -184,8 +193,14 @@ class OnlineEagle3Model(Eagle3Model):
             reduce_metrics_fn=adapter.reduce_metrics,
             reduce_loss_fn=adapter.reduce_loss,
         )
+        if loss_scale != 1.0:
+            # The trimmed loss kernel averages over n_sup supervised positions, but
+            # the full-length semantics average over L; rescale to recover it. Only
+            # valid when lk_loss_type is None (a plain KL loss is linearly scalable).
+            loss = loss * loss_scale
         loss_denom = torch.tensor(
-            logits.shape[0] * logits.shape[1],
+            logits.shape[0]
+            * (full_positions if full_positions is not None else logits.shape[1]),
             device=logits.device,
             dtype=torch.float32,
         )
@@ -285,18 +300,38 @@ class OnlineEagle3Model(Eagle3Model):
                 chunk_size=compact_teacher_chunk_size,
             )
             del target_hidden_for_compact
+            trim_pack = None
         else:
-            (
-                target_p_padded,
-                target_p_on_draft_padded,
-                target_token_ids_padded,
-                position_mask,
-            ) = _compute_target_p_padded(
-                target=target,
-                t2d=self.draft_model.t2d,
-                loss_mask=loss_mask,
-                length=self.length,
+            # A-level trim: with batch==1 and no lk_loss, compute the teacher only at
+            # supervised positions; fall back to the full path otherwise.
+            _trim_ok = (
+                self.trim_loss_positions
+                and self.lk_loss_type is None
+                and loss_mask.shape[0] == 1
+                and int(loss_mask.sum().item()) > 0
+                and not is_vlm  # VLM (mrope) is not handled by the trim path
             )
+            if _trim_ok:
+                trim_pack = _build_trim_pack(
+                    target, self.draft_model.t2d, loss_mask, self.length
+                )
+                target_p_padded = None
+                target_p_on_draft_padded = None
+                target_token_ids_padded = None
+                position_mask = trim_pack["position_mask_sup"]
+            else:
+                trim_pack = None
+                (
+                    target_p_padded,
+                    target_p_on_draft_padded,
+                    target_token_ids_padded,
+                    position_mask,
+                ) = _compute_target_p_padded(
+                    target=target,
+                    t2d=self.draft_model.t2d,
+                    loss_mask=loss_mask,
+                    length=self.length,
+                )
             del target
         torch.cuda.empty_cache()
 
@@ -359,33 +394,46 @@ class OnlineEagle3Model(Eagle3Model):
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         for idx in range(self.length):
-            state = adapter.step_view(
-                idx=idx,
-                ttt_length=self.length,
-                global_input_ids=global_input_ids,
-                attention_mask=attention_mask,
-                loss_mask=loss_mask,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                target_p_padded=target_p_padded,
-                target_p_on_draft_padded=target_p_on_draft_padded,
-                target_token_ids_padded=target_token_ids_padded,
-                position_mask=position_mask,
-                seq_length=seq_length,
-            )
+            if trim_pack is not None:
+                # A-level: the teacher tables are already compacted to supervised
+                # positions; the backbone runs full-length and only supervised rows
+                # go through logits/loss below (see the trim_pack branch further down).
+                step_input_ids = global_input_ids
+                step_hidden = hidden_states
+                step_attn = attention_mask
+                step_pos = position_ids
+            else:
+                state = adapter.step_view(
+                    idx=idx,
+                    ttt_length=self.length,
+                    global_input_ids=global_input_ids,
+                    attention_mask=attention_mask,
+                    loss_mask=loss_mask,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    target_p_padded=target_p_padded,
+                    target_p_on_draft_padded=target_p_on_draft_padded,
+                    target_token_ids_padded=target_token_ids_padded,
+                    position_mask=position_mask,
+                    seq_length=seq_length,
+                )
+                step_input_ids = state.input_ids
+                step_hidden = state.hidden_states
+                step_attn = state.attention_mask
+                step_pos = state.position_ids
             is_last = idx == self.length - 1
 
             # Step 5.1: embed the input ids
-            inputs_embeds = self.draft_model.embed_input_ids(state.input_ids)
+            inputs_embeds = self.draft_model.embed_input_ids(step_input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states.dtype)
 
             # Step 5.2: run the draft model backbone
             hidden_states_out = self.draft_model.backbone(
                 input_embeds=inputs_embeds,
-                hidden_states=state.hidden_states,
+                hidden_states=step_hidden,
                 cache_hidden=cache_hidden,
-                attention_mask=state.attention_mask,
-                position_ids=state.position_ids,
+                attention_mask=step_attn,
+                position_ids=step_pos,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
@@ -393,27 +441,53 @@ class OnlineEagle3Model(Eagle3Model):
             # update hidden states for next step
             hidden_states = hidden_states_out
 
-            # Step 5.4: get logits
-            logits = self.draft_model.compute_logits(hidden_states)
-
-            # Step 5.5 + 5.6: metric and loss
-            (
-                acc,
-                acceptance_rate,
-                loss,
-                correct,
-                denom,
-                metric_loss,
-                loss_denom,
-            ) = self._acc_and_loss(
-                logits=logits,
-                target_p=state.target_p,
-                target_p_on_draft=state.target_p_on_draft,
-                target_token_ids=state.target_token_ids,
-                position_mask=state.position_mask,
-                loss_mask=state.loss_mask,
-                adapter=adapter,
-            )
+            # Step 5.4 + 5.5 + 5.6: logits, metric and loss
+            if trim_pack is not None:
+                # A-level: only supervised rows go through norm + lm_head; the teacher
+                # tables are indexed by the same TTT sliding-window step (idx_steps).
+                sup = trim_pack["sup"]
+                idx_j = trim_pack["idx_steps"][idx]
+                hidden_sup = hidden_states.index_select(1, sup)
+                logits = self.draft_model.compute_logits(hidden_sup)
+                n_sup = sup.numel()
+                (
+                    acc,
+                    acceptance_rate,
+                    loss,
+                    correct,
+                    denom,
+                    metric_loss,
+                    loss_denom,
+                ) = self._acc_and_loss(
+                    logits=logits,
+                    target_p=trim_pack["target_p_c"].index_select(1, idx_j),
+                    target_p_on_draft=trim_pack["on_draft_c"].index_select(1, idx_j),
+                    target_token_ids=trim_pack["token_ids_c"].index_select(1, idx_j),
+                    position_mask=trim_pack["position_mask_sup"],
+                    loss_mask=trim_pack["loss_mask_sup"],
+                    adapter=adapter,
+                    loss_scale=n_sup / trim_pack["full_len"],
+                    full_positions=trim_pack["full_len"],
+                )
+            else:
+                logits = self.draft_model.compute_logits(hidden_states)
+                (
+                    acc,
+                    acceptance_rate,
+                    loss,
+                    correct,
+                    denom,
+                    metric_loss,
+                    loss_denom,
+                ) = self._acc_and_loss(
+                    logits=logits,
+                    target_p=state.target_p,
+                    target_p_on_draft=state.target_p_on_draft,
+                    target_token_ids=state.target_token_ids,
+                    position_mask=state.position_mask,
+                    loss_mask=state.loss_mask,
+                    adapter=adapter,
+                )
             acces.append(acc)
             acceptance_rates.append(acceptance_rate)
             plosses.append(loss)
@@ -830,6 +904,102 @@ def _compute_target_p_padded(target, t2d, loss_mask, length):
             target_token_ids_padded,
             position_mask,
         )
+
+
+def _compute_target_p_eager(target, t2d, loss_mask, row_chunk=256):
+    """Uncompiled variant of the teacher target_p computation.
+
+    Kept uncompiled because the supervised-row count varies per batch, which would
+    trigger repeated torch.compile recompilation. Mathematically identical to the
+    compiled path; chunks over rows to bound the transient full-vocab fp32
+    activation (which can reach several GB when the row count is large).
+    """
+    tps, tpds, toks, pms = [], [], [], []
+    n = target.shape[1]
+    for s in range(0, n, row_chunk):
+        t = target[:, s : s + row_chunk].float()
+        ids = t.argmax(-1)
+        tm = t2d[ids][..., None].int()
+        pms.append(tm * loss_mask[:, s : s + row_chunk])
+        dth = t[..., t2d]
+        tps.append(nn.Softmax(dim=2)(dth).detach())
+        lse = torch.logsumexp(t, dim=-1, keepdim=True)
+        tpds.append(torch.exp(dth - lse).detach())
+        toks.append(ids.detach())
+    return (
+        torch.cat(tps, 1),
+        torch.cat(tpds, 1),
+        torch.cat(toks, 1),
+        torch.cat(pms, 1),
+    )
+
+
+def _build_trim_pack(target, t2d, loss_mask, length):
+    """A-level trim (--trim-loss-positions): compute the teacher only at the
+    supervised rows and their k-step sliding-window positions.
+
+    Matches the semantics of the full-length _compute_target_p_padded + step_view
+    sliding window:
+    - the supervised-row set is shared across all k steps (the mask does not shift
+      per step; only the teacher table slides);
+    - the teacher for step j lives at position sup+j; positions beyond L map to a
+      pad row (uniform target_p 1/V, on_draft=0, token_id=0 — identical to the
+      value F.pad uses on the full-length path).
+    Supports batch==1 only (online training uses batch==1 per rank); the caller
+    falls back to the full-length path for B>1.
+    Returns a dict: sup[n_sup]; per-step gather indices idx_steps[k][n_sup]; the
+    compact teacher tables target_p_c/on_draft_c/token_ids_c ([1, n_real+1, ...],
+    last row = pad row); and position_mask_sup/loss_mask_sup ([1, n_sup, 1]).
+    """
+    with torch.no_grad():
+        B, L = loss_mask.shape[0], loss_mask.shape[1]
+        assert B == 1, "trim path requires batch==1"
+        sup = loss_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)  # [n_sup]
+        shifted = torch.cat(
+            [sup + j for j in range(length + 1)]
+        )  # steps j=0..k (k included to align with pad length)
+        uniq = torch.unique(shifted)
+        real = uniq[uniq < L]  # in-range teacher positions
+        n_real = real.numel()
+        target_sel = target[:, real]  # [1, n_real, V_target] unique full-vocab slice
+        lm_sel = loss_mask[:, real]
+        tp, tpd, tok, _ = _compute_target_p_eager(target_sel, t2d, lm_sel)
+        V_d = tp.shape[-1]
+        # append the pad row (matching the value F.pad uses on the full path)
+        pad_tp = torch.full((1, 1, V_d), 1.0 / V_d, dtype=tp.dtype, device=tp.device)
+        pad_tpd = torch.zeros((1, 1, V_d), dtype=tpd.dtype, device=tpd.device)
+        pad_tok = torch.zeros((1, 1), dtype=tok.dtype, device=tok.device)
+        target_p_c = torch.cat([tp, pad_tp], dim=1)
+        on_draft_c = torch.cat([tpd, pad_tpd], dim=1)
+        token_ids_c = torch.cat([tok, pad_tok], dim=1)
+        # remap absolute positions -> compact-table row index; uncovered / out-of-range -> pad row (n_real)
+        full_map = torch.full(
+            (L + length + 1,), n_real, dtype=torch.long, device=sup.device
+        )
+        full_map[real] = torch.arange(n_real, device=sup.device)
+        idx_steps = [full_map[sup + j] for j in range(length)]
+        # position_mask is taken at the chain start (sup), matching the full path's step-invariant semantics
+        pm_sup = _compute_position_mask_at(target, t2d, loss_mask, sup)
+        loss_mask_sup = loss_mask.view(-1)[sup].view(1, -1, 1)
+        return dict(
+            sup=sup,
+            idx_steps=idx_steps,
+            target_p_c=target_p_c,
+            on_draft_c=on_draft_c,
+            token_ids_c=token_ids_c,
+            position_mask_sup=pm_sup,
+            loss_mask_sup=loss_mask_sup,
+            full_len=L,
+        )
+
+
+def _compute_position_mask_at(target, t2d, loss_mask, sup):
+    """position_mask = t2d[argmax(target)] * loss_mask, computed only at sup positions."""
+    with torch.no_grad():
+        tsel = target[:, sup]
+        ids = tsel.float().argmax(-1)
+        tm = t2d[ids][..., None].int()
+        return tm * loss_mask[:, sup]
 
 
 @torch.compile(dynamic=None)

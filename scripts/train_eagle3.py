@@ -185,6 +185,15 @@ def build_parser() -> ArgumentParser:
         default=7,
         help="The length for Test-Time Training (TTT).",
     )
+    training_group.add_argument(
+        "--trim-loss-positions",
+        action="store_true",
+        help="Compute the teacher target_p, draft logits and loss only at "
+        "supervised (loss-masked) positions instead of over the full sequence. "
+        "Mathematically equivalent (the mean denominator is rescaled) and saves "
+        "memory/compute on prompt-heavy data. Applies to online training with "
+        "batch==1 and no lk_loss; otherwise it is ignored (full-length fallback).",
+    )
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
         "--ckpt-dir",
@@ -1079,6 +1088,7 @@ def main():
                 lk_loss_type=args.lk_loss_type,
                 kl_scale=args.kl_scale,
                 kl_decay=args.kl_decay,
+                trim_loss_positions=args.trim_loss_positions,
             )
         else:
             # offline: the target_model is TargetHead not a model
@@ -1089,6 +1099,7 @@ def main():
                 lk_loss_type=args.lk_loss_type,
                 kl_scale=args.kl_scale,
                 kl_decay=args.kl_decay,
+                trim_loss_positions=args.trim_loss_positions,
             )
     eagle3_model = FSDP(
         eagle3_model,
