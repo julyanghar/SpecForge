@@ -171,6 +171,14 @@ def build_parser() -> ArgumentParser:
         "supervised rows (prompt rows serve as step-1 KV context only). Default off.",
     )
     model_group.add_argument(
+        "--trim-step1",
+        action="store_true",
+        dest="trim_step1",
+        help="B-ii trim (requires --trim-prompt-rows): also short-circuit STEP 1 prompt "
+        "rows — compute their K/V (needed as context) but skip q/attn/o_proj/MLP "
+        "(gradient dead-ends). Equivalence-preserving. Default off.",
+    )
+    model_group.add_argument(
         "--shard-target-output",
         action=argparse.BooleanOptionalAction,
         help="Whether the target model output is sharded across batch dimension",
@@ -1155,6 +1163,7 @@ def main():
                 kl_decay=args.kl_decay,
                 trim_loss_positions=args.trim_loss_positions,
                 trim_prompt_rows=args.trim_prompt_rows,
+                trim_step1=args.trim_step1,
             )
         else:
             # offline: the target_model is TargetHead not a model

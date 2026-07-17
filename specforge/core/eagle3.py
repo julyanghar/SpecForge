@@ -118,6 +118,7 @@ class OnlineEagle3Model(Eagle3Model):
         kl_decay: float = 1.0,
         trim_loss_positions: bool = False,
         trim_prompt_rows: bool = False,
+        trim_step1: bool = False,
     ):
         """
         Args:
@@ -140,6 +141,8 @@ class OnlineEagle3Model(Eagle3Model):
         self.kl_decay = kl_decay
         self.trim_loss_positions = trim_loss_positions
         self.trim_prompt_rows = trim_prompt_rows
+        # B-ii: 步1 也短路 prompt 行(只算 K/V)。需 trim_prompt_rows。
+        self.trim_step1 = trim_step1
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -306,6 +309,7 @@ class OnlineEagle3Model(Eagle3Model):
                 and self.lk_loss_type is None
                 and loss_mask.shape[0] == 1
                 and int(loss_mask.sum().item()) > 0
+                and not is_vlm  # 非VL边界:VLM(mrope)不走 trim，全长回退
             )
             if _trim_ok:
                 import os as _os4
@@ -413,29 +417,57 @@ class OnlineEagle3Model(Eagle3Model):
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
         _trim_B = trim_pack is not None and self.trim_prompt_rows
+        _trim_step1 = _trim_B and self.trim_step1  # B-ii:步1 也短路 prompt 行
         _sc_ref = None  # SELFCHECK 参考链(全长,no_grad,独立 cache)
+        import os as _os5
+        _sc_on = _os5.environ.get("MCTRIM_SELFCHECK", "0") == "1"
         for idx in range(self.length):
-            _b_active = _trim_B and idx >= 1
-            trim_ctx = (
-                {"sup": trim_pack["sup"], "full_len": seq_length, "step_idx": idx}
-                if _b_active else None
-            )
-            if _b_active:
-                # MCTRIM(B级):步 2..k 只跑监督行。步1输出在 idx==1 入口压紧;
-                # 之后 hidden 一直是紧凑形。rope 位置传绝对值 sup+idx。
-                import os as _os5
-                if idx == 1 and _os5.environ.get("MCTRIM_SELFCHECK", "0") == "1":
+            _b_step1 = _trim_step1 and idx == 0  # B-ii 步1:q=[n_sup]/kv=[L] 拆分
+            # _b_active = 本步 backbone 输出为紧凑形(步2..k,或 B-ii 的步1)
+            _b_active = (_trim_B and idx >= 1) or _b_step1
+            trim_ctx = None
+            if _b_step1:
+                # B-ii(步1):喂全长(prompt 行 K/V 需全行 embed+hidden),trim_ctx 标
+                # step1_kv;attention 内部把 q 取 sup 行、k/v 保全长、rope 分别施。
+                trim_ctx = {
+                    "sup": trim_pack["sup"], "full_len": seq_length,
+                    "step_idx": 0, "step1_kv": True,
+                }
+                step_input_ids = global_input_ids   # 全长(k/v 用全行 embed)
+                step_hidden = hidden_states          # 全长
+                step_attn = attention_mask
+                step_pos = position_ids              # k 的全长位置(q 用 sup,在 attention 内取)
+                if _sc_on:
+                    # 自检:单独跑一遍全长 step1(no_grad,独立 cache)当参考 + seed _sc_ref
+                    with torch.no_grad():
+                        _re = self.draft_model.embed_input_ids(global_input_ids).to(
+                            hidden_states.dtype
+                        )
+                        _rc = DynamicCache()
+                        _ro = self.draft_model.backbone(
+                            input_embeds=_re, hidden_states=hidden_states,
+                            cache_hidden=None, attention_mask=attention_mask,
+                            position_ids=position_ids, past_key_values=_rc,
+                            use_cache=True, trim_ctx=None,  # 全长 step1 参考
+                        )
+                        _sc_ref = {"hidden": _ro, "cache": _rc}
+            elif _b_active:
+                # MCTRIM(B级 步 2..k):只跑监督行。rope 位置传绝对值 sup+idx。
+                trim_ctx = {"sup": trim_pack["sup"], "full_len": seq_length, "step_idx": idx}
+                if idx == 1 and _sc_on and not _trim_step1:
+                    # B-i(无B-ii):idx==1 时 hidden 仍全长,用它 seed 参考链;
+                    # B-ii 时 _sc_ref 已在 idx==0 seed 好,跳过。
                     _sc_ref = {
                         "hidden": hidden_states.detach().clone(),
-                        "cache": None,
+                        "cache": DynamicCache(),
                     }
-                    _sc_ref["cache"] = DynamicCache()
                     _sc_ref["cache"].update(
                         past_key_values.layers[0].keys.detach().clone(),
                         past_key_values.layers[0].values.detach().clone(),
                         layer_idx=0,
                     )
-                if idx == 1:
+                if idx == 1 and not _trim_step1:
+                    # B-i:step1 全长输出,idx==1 入口压紧;B-ii:step1 已返回紧凑,跳过。
                     hidden_states = hidden_states.index_select(1, trim_pack["sup"])
                 step_input_ids = global_input_ids.index_select(1, trim_pack["sup"])
                 step_hidden = hidden_states
@@ -484,8 +516,14 @@ class OnlineEagle3Model(Eagle3Model):
                 use_cache=True,
                 trim_ctx=trim_ctx,
             )
-            if _b_active and _sc_ref is not None:
-                # MCTRIM_SCB:全长参考链(no_grad,独立 cache)对拍监督行输出
+            if _b_step1 and _sc_ref is not None:
+                # MCTRIM_SCB(B-ii 步0):紧凑 step1 输出 vs idx==0 已算好的全长 step1 参考
+                _d = (
+                    _sc_ref["hidden"].index_select(1, trim_pack["sup"]) - hidden_states_out
+                ).abs().max().item()
+                print(f"MCTRIM_SCB step=0 hid_maxdiff={_d:.3e}", flush=True)
+            elif _b_active and _sc_ref is not None:
+                # MCTRIM_SCB(步 2..k):全长参考链(no_grad,独立 cache)对拍监督行输出
                 with torch.no_grad():
                     _ref_embeds = self.draft_model.embed_input_ids(global_input_ids)
                     _ref_embeds = _ref_embeds.to(_sc_ref["hidden"].dtype)

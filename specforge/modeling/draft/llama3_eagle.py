@@ -807,6 +807,80 @@ class LlamaFlexAttention(LlamaAttention):
             past_key_values.get_seq_length() if past_key_values is not None else 0
         )
 
+        if trim_ctx is not None and trim_ctx.get("step1_kv"):
+            # ============ B-ii(步1):k/v 全长 [L]，q 只 sup 行 [n_sup] ============
+            # prompt 行的 q/attn/o_proj/MLP 是梯度死路(见 eagle3.py 循环)，这里不算；
+            # 但 prompt 行 K/V 被 sup 行(步1)+步2..k 回读，必须全长算。
+            # 关键坑:query_len(=n_sup) 与 kv_len(=L) 不同，且 rope 位置不同 → 分别处理。
+            sup = trim_ctx["sup"]
+            full_len = trim_ctx["full_len"]  # = L
+            kv_len = hidden_states.size(1)  # = L
+            q_len_q = sup.numel()  # = n_sup
+            # K/V:全长 hidden
+            key_states = (
+                self.k_proj(hidden_states)
+                .view(bsz, kv_len, self.num_key_value_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            value_states = (
+                self.v_proj(hidden_states)
+                .view(bsz, kv_len, self.num_key_value_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            # Q:只 sup 行(RMSNorm 逐行独立 → 取 sup 行的 norm 后 concat 等于全长后取 sup)
+            query_states = (
+                self.q_proj(hidden_states.index_select(1, sup))
+                .view(bsz, q_len_q, self.num_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            # rope:表按 full_len+1 建(覆盖 0..L-1 及 sup)；k 用全长 position_ids、q 用 sup 绝对位
+            cos, sin = self.rotary_emb(query_states, seq_len=full_len + 1)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            _, key_states = apply_rotary_pos_emb(
+                key_states, key_states, cos, sin, position_ids
+            )
+            query_states, _ = apply_rotary_pos_emb(
+                query_states, query_states, cos, sin, sup.unsqueeze(0)
+            )
+            # 写 cache(全长 K/V);cache_position 用 kv 长度 L(非 n_sup)
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + kv_len, device=hidden_states.device
+            )
+            key_cache, value_cache = past_key_values.update(
+                key_states,
+                value_states,
+                layer_idx=0,
+                cache_kwargs={"sin": sin, "cos": cos, "cache_position": cache_position},
+            )
+            # mask:q=[n_sup] 对 kv=[L] 的 prefix causal(step0 时 KV_LEN==full_len，suffix 不触发)
+            seq_lengths = attention_mask.sum(dim=-1)  # step_idx=0，不减
+            from specforge.modeling.draft.flex_attention import (
+                generate_eagle3_mask_compact,
+            )
+            _mask_mod = generate_eagle3_mask_compact(
+                sup=sup, seq_lengths=seq_lengths, full_len=full_len,
+                Q_LEN=q_len_q, KV_LEN=key_cache.shape[-2],
+            )
+            if q_len_q <= 128:
+                _cbm, _fa = create_block_mask, flex_attention
+            else:
+                _cbm, _fa = compile_friendly_create_block_mask, compile_friendly_flex_attention
+            block_mask = _cbm(
+                mask_mod=_mask_mod, B=bsz, H=1,
+                Q_LEN=q_len_q, KV_LEN=key_cache.shape[-2], device=query_states.device,
+            )
+            attn_output = _fa(
+                query=query_states,
+                key=key_cache.contiguous(),
+                value=value_cache.contiguous(),
+                block_mask=block_mask,
+                enable_gqa=True,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len_q, self.head_dim * self.num_heads)
+            return self.o_proj(attn_output)
+            # ============ B-ii 步1 分支结束(以下为原路径，off 时逐字节不变) ============
+
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -1673,6 +1747,9 @@ class LlamaDecoderLayer(nn.Module):
             trim_ctx=trim_ctx,
         )
         _MCDBG("layer.attn_out", hidden_states)
+        if trim_ctx is not None and trim_ctx.get("step1_kv"):
+            # B-ii 步1:attn 输出已是 [n_sup]，残差(全长)取 sup 行对齐；MLP 随后也在 [n_sup] 上跑
+            residual = residual.index_select(1, trim_ctx["sup"])
         hidden_states = residual + hidden_states
 
         # Fully Connected
