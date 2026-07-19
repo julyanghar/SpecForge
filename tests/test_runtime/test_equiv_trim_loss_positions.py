@@ -12,6 +12,7 @@ GPU-only, matching the other online EAGLE3 equivalence tests in this directory.
 """
 
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -36,6 +37,7 @@ class TestEquivTrimLossPositions(unittest.TestCase):
 
         H, V, SEQ, TTT = fx.H, fx.V, 16, 3
         workdir = tempfile.mkdtemp(prefix="equiv_trim_")
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
         target, _dir, _aux = fx.build_hf_target(workdir, hidden=H, layers=8, vocab=V)
         cfg = fx.write_draft_config(os.path.join(workdir, "draft.json"))
         vocab_path = fx.write_vocab_mapping(os.path.join(workdir, "vm.pt"))

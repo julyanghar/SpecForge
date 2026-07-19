@@ -922,7 +922,7 @@ def _compute_target_p_eager(target, t2d, loss_mask, row_chunk=256):
         tm = t2d[ids][..., None].int()
         pms.append(tm * loss_mask[:, s : s + row_chunk])
         dth = t[..., t2d]
-        tps.append(nn.Softmax(dim=2)(dth).detach())
+        tps.append(F.softmax(dth, dim=2).detach())
         lse = torch.logsumexp(t, dim=-1, keepdim=True)
         tpds.append(torch.exp(dth - lse).detach())
         toks.append(ids.detach())
@@ -955,9 +955,11 @@ def _build_trim_pack(target, t2d, loss_mask, length):
         B, L = loss_mask.shape[0], loss_mask.shape[1]
         assert B == 1, "trim path requires batch==1"
         sup = loss_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)  # [n_sup]
-        shifted = torch.cat(
-            [sup + j for j in range(length + 1)]
-        )  # steps j=0..k (k included to align with pad length)
+        # steps j=0..k (k included to align with pad length). The ordering here is
+        # irrelevant because torch.unique below sorts and de-duplicates.
+        shifted = (sup.unsqueeze(1) + torch.arange(length + 1, device=sup.device)).view(
+            -1
+        )
         uniq = torch.unique(shifted)
         real = uniq[uniq < L]  # in-range teacher positions
         n_real = real.numel()
@@ -977,7 +979,11 @@ def _build_trim_pack(target, t2d, loss_mask, length):
             (L + length + 1,), n_real, dtype=torch.long, device=sup.device
         )
         full_map[real] = torch.arange(n_real, device=sup.device)
-        idx_steps = [full_map[sup + j] for j in range(length)]
+        idx_steps = list(
+            full_map[sup.unsqueeze(1) + torch.arange(length, device=sup.device)].unbind(
+                1
+            )
+        )
         # position_mask is taken at the chain start (sup), matching the full path's step-invariant semantics
         pm_sup = _compute_position_mask_at(target, t2d, loss_mask, sup)
         loss_mask_sup = loss_mask.view(-1)[sup].view(1, -1, 1)
