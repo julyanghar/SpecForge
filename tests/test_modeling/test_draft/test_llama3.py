@@ -152,9 +152,13 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         loaded = LlamaForCausalLMEagle3.from_pretrained(self.temp_dir)
 
         # The fix in build_draft_model: rebuild non-persistent rotary buffers.
+        rebuilt = False
         for module in loaded.modules():
-            if hasattr(module, "_init_rope"):
-                module._init_rope()
+            init_rope = getattr(module, "_init_rope", None)
+            if callable(init_rope):
+                init_rope()
+                rebuilt = True
+        self.assertTrue(rebuilt, "no module exposed a callable _init_rope()")
 
         got_rot = loaded.midlayer.self_attn.rotary_emb
         for name, ref_val in ref_bufs.items():

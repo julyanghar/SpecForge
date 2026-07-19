@@ -536,12 +536,21 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         # diverge to loss=NaN. Rebuild them by re-running _init_rope before .cuda().
         rebuilt_rope = False
         for module in draft_model.modules():
-            if hasattr(module, "_init_rope"):
-                module._init_rope()
+            init_rope = getattr(module, "_init_rope", None)
+            if callable(init_rope):
+                init_rope()
                 rebuilt_rope = True
         if rebuilt_rope:
             print_with_rank(
                 "Rebuilt non-persistent rotary buffers after from_pretrained"
+            )
+        else:
+            # Deliberately loud: if nothing was rebuilt, the checkpoint's rotary
+            # buffers may still be uninitialized, which is exactly the NaN failure
+            # mode this guards against.
+            print_with_rank(
+                "WARNING: no module exposing _init_rope() was found; "
+                "non-persistent rotary buffers were NOT rebuilt"
             )
         draft_model = draft_model.cuda()
     else:
