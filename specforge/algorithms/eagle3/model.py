@@ -22,8 +22,6 @@
 
 """EAGLE3 training model implementation."""
 
-import os  # MCUSP_ temp probe import
-
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -518,23 +516,6 @@ class OnlineEagle3Model(Eagle3Model):
                     loss_scale=nrows_j / trim_pack["full_len"],
                     full_positions=trim_pack["full_len"],
                 )
-                if os.environ.get("MCUSP_DBG"):  # MCUSP_ temp probe
-                    _pmr = pm_j.view(-1).nonzero().view(-1)
-                    _lg = logits.index_select(1, _pmr)
-                    _tp = trim_pack["target_p_c"].index_select(1, keep_j).index_select(
-                        1, _pmr
-                    )
-                    _rows_pm = rows_j.index_select(0, _pmr)
-                    print(
-                        f"MCUSP_DBG mode=trim step={idx} rows={rows_j.tolist()} "
-                        f"pmrows={_rows_pm.tolist()} "
-                        f"hin={step_hidden.float().sum().item():.6e} "
-                        f"lgs={_lg.float().abs().sum().item():.6e} "
-                        f"tps={_tp.float().abs().sum().item():.6e} "
-                        f"scale={nrows_j}/{trim_pack['full_len']} "
-                        f"loss={float(loss.item()):.10e}",
-                        flush=True,
-                    )
             else:
                 logits = self.draft_model.compute_logits(hidden_states)
                 (
@@ -554,18 +535,6 @@ class OnlineEagle3Model(Eagle3Model):
                     loss_mask=state.loss_mask,
                     adapter=adapter,
                 )
-                if os.environ.get("MCUSP_DBG"):  # MCUSP_ temp probe
-                    _pmr = state.position_mask.view(-1).nonzero().view(-1)
-                    _lg = logits.index_select(1, _pmr)
-                    _tp = state.target_p.index_select(1, _pmr)
-                    print(
-                        f"MCUSP_DBG mode=full step={idx} pmrows={_pmr.tolist()} "
-                        f"hin={step_hidden.float().sum().item():.6e} "
-                        f"lgs={_lg.float().abs().sum().item():.6e} "
-                        f"tps={_tp.float().abs().sum().item():.6e} "
-                        f"loss={float(loss.item()):.10e}",
-                        flush=True,
-                    )
             acces.append(acc)
             acceptance_rates.append(acceptance_rate)
             plosses.append(loss)
