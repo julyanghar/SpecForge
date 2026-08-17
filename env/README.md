@@ -1,6 +1,13 @@
 # conda env 备份:specforge
 
-EAGLE-3 域训环境(phase2-12k-3ep 权重的训练环境,target backend = sglang)。
+EAGLE-3 域训环境(target backend = sglang)。
+
+**注意**:本快照拍摄于 **2026-08-16**,不是 phase2 训练(2026-07-14)当时的环境——
+中间有包漂移(如 flash-attn 系列版本;训练时 flash_attn 实际 import 失败,
+fallback 到 flex_attention,证据见 deep_researcher_demo 仓库
+train/Eagle3/run-artifacts/retrain.log 的 UserWarning 行)。训练当时的权威参数记录是
+training_state.pt 的 args 字段(79 项,HF julyanghar/Efficient-DRAgent),
+代码版本 = 本仓库 commit `77f4a0f`(yilin-trim-mem-probes 分支)。
 
 | 文件 | 说明 |
 |---|---|
